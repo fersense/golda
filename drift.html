@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+        }
+
+        canvas#scene {
+            display: block;
+        }
+
+        #gauge {
+            position: absolute;
+            left: 12px;
+            bottom: 12px;
+            z-index: 10;
+            pointer-events: none;
+            user-select: none;
+            background: rgba(24, 26, 30, 0.88);
+            border-radius: 12px;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gauge"></canvas>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87ceeb);
+
+        const camera = new THREE.PerspectiveCamera(
+            75,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            1000
+        );
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.domElement.id = "scene";
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.55);
+        scene.add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.9);
+        directionalLight.castShadow = true;
+
+        directionalLight.shadow.camera.left = -80;
+        directionalLight.shadow.camera.right = 80;
+        directionalLight.shadow.camera.top = 80;
+        directionalLight.shadow.camera.bottom = -80;
+        directionalLight.shadow.mapSize.width = 2048;
+        directionalLight.shadow.mapSize.height = 2048;
+
+        scene.add(directionalLight);
+        scene.add(directionalLight.target);
+
+        const platformSize = 200;
+
+        const platformGeometry = new THREE.BoxGeometry(platformSize, 1, platformSize);
+        const platformMaterial = new THREE.MeshStandardMaterial({
+            color: 0x4a4a4a,
+            roughness: 0.85,
+            metalness: 0.05
+        });
+
+        const platform = new THREE.Mesh(platformGeometry, platformMaterial);
+        platform.position.y = -0.5;
+        platform.receiveShadow = true;
+        scene.add(platform);
+
+        const gridHelper = new THREE.GridHelper(platformSize, 80, 0x6a6a6a, 0x5a5a5a);
+        gridHelper.position.y = 0.01;
+        scene.add(gridHelper);
+
+        const cubeGeometry = new THREE.BoxGeometry(2, 2, 3);
+        const cubeMaterial = new THREE.MeshStandardMaterial({
+            color: 0xff0000,
+            roughness: 0.35,
+            metalness: 0.4
+        });
+
+        const cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+        cube.castShadow = true;
+        cube.position.set(0, 1, 0);
+        scene.add(cube);
+
+        function clamp(value, min, max) {
+            return Math.max(min, Math.min(max, value));
+        }
+
+        function damp(current, target, lambda, dt) {
+            return current + (target - current) * (1 - Math.exp(-lambda * dt));
+        }
+
+        function smoothstep(edge0, edge1, x) {
+            const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+            return t * t * (3 - 2 * t);
+        }
+
+        const gears = [
+            { maxSpeed: -9, accel: 13, launch: 1, lowSpeed: 0, peakSpeed: 4 },
+            { maxSpeed: 9, accel: 23, launch: 1, lowSpeed: 0, peakSpeed: 4 },
+            { maxSpeed: 15, accel: 18, launch: 0.38, lowSpeed: 1.2, peakSpeed: 7 },
+            { maxSpeed: 22, accel: 15, launch: 0.12, lowSpeed: 3.5, peakSpeed: 10 },
+            { maxSpeed: 29, accel: 13, launch: 0.03, lowSpeed: 6.5, peakSpeed: 14 },
+            { maxSpeed: 37, accel: 11, launch: 0.005, lowSpeed: 10.5, peakSpeed: 18 },
+            { maxSpeed: 46, accel: 10, launch: 0, lowSpeed: 14.5, peakSpeed: 24 }
+        ];
+
+        function engineFactor(gear, longitudinalSpeed) {
+            const speed = Math.abs(longitudinalSpeed);
+
+            if (gear.peakSpeed <= gear.lowSpeed) {
+                return clamp(gear.launch, 0, 1);
+            }
+
+            const curve = smoothstep(gear.lowSpeed, gear.peakSpeed, speed);
+            return clamp(gear.launch + (1 - gear.launch) * curve, 0, 1);
+        }
+
+        let gearIndex = 1;
+
+        const car = {
+            position: new THREE.Vector3(0, 1, 0),
+            velocity: new THREE.Vector3(0, 0, 0),
+            heading: 0,
+            steer: 0,
+            throttle: 0,
+            brake: 0,
+            rpmTarget: 900
+        };
+
+        const keys = Object.create(null);
+
+        function shiftUp() {
+            gearIndex = Math.min(gearIndex + 1, gears.length - 1);
+        }
+
+        function shiftDown() {
+            gearIndex = Math.max(gearIndex - 1, 0);
+        }
+
+        let cameraMode = "chase";
+        let orbitYaw = Math.PI;
+        let orbitPitch = 0.45;
+        let orbitDistance = 12;
+
+        let isDragging = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+
+        const mouseSensitivity = 0.0026;
+
+        const cameraOffset = new THREE.Vector3(0, 5, -10);
+        const cameraLookOffset = new THREE.Vector3(0, 1, 0);
+
+        function requestPointerLockSafe() {
+            try {
+                const result = renderer.domElement.requestPointerLock();
+                if (result && typeof result.catch === "function") {
+                    result.catch(() => {});
+                }
+            } catch (error) {}
+        }
+
+        function exitPointerLockSafe() {
+            try {
+                if (document.pointerLockElement === renderer.domElement) {
+                    document.exitPointerLock();
+                }
+            } catch (error) {}
+        }
+
+        function toggleCameraMode() {
+            if (cameraMode === "chase") {
+                cameraMode = "orbit";
+
+                const target = car.position.clone().add(cameraLookOffset);
+                const offset = camera.position.clone().sub(target);
+
+                orbitDistance = clamp(offset.length(), 6, 45);
+
+                if (orbitDistance > 0.001) {
+                    orbitYaw = Math.atan2(offset.x, offset.z);
+                    orbitPitch = clamp(
+                        Math.asin(clamp(offset.y / orbitDistance, -1, 1)),
+                        0.05,
+                        1.45
+                    );
+                } else {
+                    orbitYaw = car.heading + Math.PI;
+                    orbitPitch = 0.45;
+                }
+
+                requestPointerLockSafe();
+            } else {
+                cameraMode = "chase";
+                exitPointerLockSafe();
+            }
+        }
+
+        window.addEventListener("keydown", (event) => {
+            keys[event.code] = true;
+
+            if (!event.repeat) {
+                if (event.code === "ShiftLeft" || event.code === "ShiftRight") {
+                    shiftUp();
+                }
+
+                if (event.code === "ControlLeft" || event.code === "ControlRight") {
+                    shiftDown();
+                }
+
+                if (
+                    event.code === "KeyV" &&
+                    !event.ctrlKey &&
+                    !event.shiftKey &&
+                    !event.altKey
+                ) {
+                    toggleCameraMode();
+                }
+            }
+
+            if (event.code === "Space") {
+                event.preventDefault();
+            }
+        });
+
+        window.addEventListener("keyup", (event) => {
+            keys[event.code] = false;
+        });
+
+        window.addEventListener("blur", () => {
+            for (const key in keys) {
+                keys[key] = false;
+            }
+
+            isDragging = false;
+        });
+
+        renderer.domElement.addEventListener("mousedown", (event) => {
+            if (cameraMode !== "orbit") return;
+            if (event.button !== 0) return;
+
+            isDragging = true;
+            lastMouseX = event.clientX;
+            lastMouseY = event.clientY;
+        });
+
+        window.addEventListener("mouseup", () => {
+            isDragging = false;
+        });
+
+        window.addEventListener("mousemove", (event) => {
+            if (cameraMode !== "orbit") return;
+
+            let dx = 0;
+            let dy = 0;
+
+            if (document.pointerLockElement === renderer.domElement) {
+                dx = event.movementX;
+                dy = event.movementY;
+            } else if (isDragging) {
+                dx = event.clientX - lastMouseX;
+                dy = event.clientY - lastMouseY;
+
+                lastMouseX = event.clientX;
+                lastMouseY = event.clientY;
+            } else {
+                return;
+            }
+
+            orbitYaw -= dx * mouseSensitivity;
+            orbitPitch += dy * mouseSensitivity;
+
+            orbitPitch = clamp(orbitPitch, 0.05, 1.45);
+        });
+
+        renderer.domElement.addEventListener("click", () => {
+            if (
+                cameraMode === "orbit" &&
+                document.pointerLockElement !== renderer.domElement
+            ) {
+                requestPointerLockSafe();
+            }
+        });
+
+        renderer.domElement.addEventListener(
+            "wheel",
+            (event) => {
+                if (cameraMode !== "orbit") return;
+
+                orbitDistance += event.deltaY * 0.01;
+                orbitDistance = clamp(orbitDistance, 6, 45);
+
+                event.preventDefault();
+            },
+            { passive: false }
+        );
+
+        const GAUGE_W = 250;
+        const GAUGE_H = 250;
+
+        const gaugeCanvas = document.getElementById("gauge");
+        const gaugeCtx = gaugeCanvas.getContext("2d");
+
+        function setupGauge() {
+            const dpr = window.devicePixelRatio || 1;
+
+            gaugeCanvas.width = GAUGE_W * dpr;
+            gaugeCanvas.height = GAUGE_H * dpr;
+            gaugeCanvas.style.width = GAUGE_W + "px";
+            gaugeCanvas.style.height = GAUGE_H + "px";
+
+            gaugeCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+
+        window.addEventListener("resize", () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            setupGauge();
+        });
+
+        setupGauge();
+
+        function drawGauge(needleValue, speedKmh, gearName) {
+            const ctx = gaugeCtx;
+
+            ctx.clearRect(0, 0, GAUGE_W, GAUGE_H);
+
+            const cx = 112;
+            const cy = 110;
+            const r = 86;
+
+            const startDeg = 240;
+            const endDeg = -20;
+            const maxVal = 10;
+            const degPerVal = (startDeg - endDeg) / maxVal;
+
+            function angleFor(v) {
+                return ((startDeg - degPerVal * v) * Math.PI) / 180;
+            }
+
+            ctx.lineCap = "round";
+
+            for (let v = 0; v <= maxVal; v++) {
+                const a = angleFor(v);
+                const cos = Math.cos(a);
+                const sin = Math.sin(a);
+                const red = v >= 8;
+
+                ctx.strokeStyle = red ? "#ff4646" : "#a7adb4";
+                ctx.lineWidth = 4;
+                ctx.beginPath();
+                ctx.moveTo(cx + cos * r, cy - sin * r);
+                ctx.lineTo(cx + cos * (r - 13), cy - sin * (r - 13));
+                ctx.stroke();
+
+                if (v !== 7) {
+                    ctx.fillStyle = red ? "#ff5a5a" : "#cfd4da";
+                    ctx.font = "italic bold 15px Arial, sans-serif";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.fillText(String(v), cx + cos * (r - 28), cy - sin * (r - 28));
+                }
+            }
+
+            const nv = clamp(needleValue, 0, maxVal);
+            const na = angleFor(nv);
+
+            ctx.save();
+            ctx.strokeStyle = "#f4f4f4";
+            ctx.lineWidth = 4;
+            ctx.shadowColor = "rgba(255,255,255,0.55)";
+            ctx.shadowBlur = 7;
+            ctx.beginPath();
+            ctx.moveTo(cx - Math.cos(na) * 10, cy + Math.sin(na) * 10);
+            ctx.lineTo(cx + Math.cos(na) * (r - 18), cy - Math.sin(na) * (r - 18));
+            ctx.stroke();
+            ctx.restore();
+
+            ctx.strokeStyle = "#7bdc82";
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(cx, cy, 25, 0, Math.PI * 2);
+            ctx.stroke();
+
+            ctx.fillStyle = "#7bdc82";
+            ctx.font = "italic bold 28px Arial, sans-serif";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(gearName, cx, cy + 1);
+
+            ctx.fillStyle = "#8d939b";
+            ctx.font = "italic bold 16px Arial, sans-serif";
+            ctx.textAlign = "right";
+            ctx.textBaseline = "alphabetic";
+            ctx.fillText("KM/H", GAUGE_W - 14, 188);
+
+            const digits = String(clamp(Math.round(speedKmh), 0, 999)).padStart(3, "0");
+
+            ctx.font = "italic bold 52px Arial, sans-serif";
+
+            const widths = [];
+            let total = 0;
+
+            for (const ch of digits) {
+                const w = ctx.measureText(ch).width;
+                widths.push(w);
+                total += w;
+            }
+
+            let x = GAUGE_W - 14 - total;
+            ctx.textAlign = "left";
+
+            let leading = true;
+
+            for (let i = 0; i < digits.length; i++) {
+                if (digits[i] !== "0") leading = false;
+
+                ctx.fillStyle = leading && i < digits.length - 1 ? "#8d939b" : "#ffffff";
+                ctx.fillText(digits[i], x, 234);
+
+                x += widths[i];
+            }
+        }
+
+        const clock = new THREE.Clock();
+
+        const forward = new THREE.Vector3();
+        const side = new THREE.Vector3();
+
+        const normalMaxTurnRate = 1.62;
+        const driftMaxTurnRate = 0.95;
+
+        const normalSteerResponse = 18;
+        const driftSteerResponse = 10;
+
+        const normalGrip = 95;
+        const handbrakeGrip = 1.6;
+
+        const gripEngageRate = 10;
+        const gripRecoveryRate = 0.9;
+
+        const brakeForce = 30;
+        const handbrakeBrakeForce = 4;
+
+        const handbrakeYawMultiplier = 1.15;
+        const oversteerStrength = 0.6;
+        const maxYawRate = 1.45;
+
+        const handbrakeKick = 0.3;
+        const slideSustain = 0.15;
+
+        const topSpeed = gears[gears.length - 1].maxSpeed;
+
+        let currentGrip = normalGrip;
+        let smoothDisplaySpeed = 0;
+        let smoothRpm = 900;
+
+        function updateCar(dt) {
+            const targetThrottle = keys["KeyW"] ? 1 : 0;
+            const targetBrake = keys["KeyS"] ? 1 : 0;
+            const targetSteer =
+                (keys["KeyA"] ? 1 : 0) -
+                (keys["KeyD"] ? 1 : 0);
+
+            const handbrake = !!keys["Space"];
+            const drifting = handbrake || currentGrip < 20;
+
+            car.throttle = damp(car.throttle, targetThrottle, 12, dt);
+            car.brake = damp(car.brake, targetBrake, 12, dt);
+            car.steer = damp(
+                car.steer,
+                targetSteer,
+                drifting ? driftSteerResponse : normalSteerResponse,
+                dt
+            );
+
+            forward.set(
+                Math.sin(car.heading),
+                0,
+                Math.cos(car.heading)
+            );
+
+            side.set(
+                Math.cos(car.heading),
+                0,
+                -Math.sin(car.heading)
+            );
+
+            let longitudinalSpeed = car.velocity.dot(forward);
+            let sideSpeed = car.velocity.dot(side);
+            let absSpeed = Math.abs(longitudinalSpeed);
+
+            const speedFactor = drifting
+                ? 0.35 + 0.65 * Math.min(absSpeed / 7, 1)
+                : 0.55 + 0.45 * Math.min(absSpeed / 5, 1);
+
+            const highSpeedDamping = drifting
+                ? 1 - 0.22 * Math.min(absSpeed / topSpeed, 1)
+                : 1 - 0.12 * Math.min(absSpeed / topSpeed, 1);
+
+            const maxTurnRateNow = drifting
+                ? driftMaxTurnRate
+                : normalMaxTurnRate;
+
+            let yawRate =
+                car.steer *
+                maxTurnRateNow *
+                speedFactor *
+                highSpeedDamping;
+
+            if (handbrake) {
+                yawRate *= handbrakeYawMultiplier;
+            }
+
+            const driftFactor = clamp((25 - currentGrip) / 25, 0, 1);
+
+            yawRate +=
+                clamp(-sideSpeed, -25, 25) *
+                (oversteerStrength / Math.max(absSpeed, 10)) *
+                driftFactor;
+
+            yawRate = clamp(yawRate, -maxYawRate, maxYawRate);
+
+            car.heading += yawRate * dt;
+
+            forward.set(
+                Math.sin(car.heading),
+                0,
+                Math.cos(car.heading)
+            );
+
+            side.set(
+                Math.cos(car.heading),
+                0,
+                -Math.sin(car.heading)
+            );
+
+            longitudinalSpeed = car.velocity.dot(forward);
+            sideSpeed = car.velocity.dot(side);
+
+            const gear = gears[gearIndex];
+            let powerFactor = 1;
+
+            if (gearIndex >= 1) {
+                powerFactor = engineFactor(gear, longitudinalSpeed);
+
+                if (car.throttle > 0.001) {
+                    if (longitudinalSpeed < gear.maxSpeed) {
+                        longitudinalSpeed +=
+                            gear.accel *
+                            powerFactor *
+                            car.throttle *
+                            dt;
+                    } else {
+                        longitudinalSpeed = Math.max(
+                            gear.maxSpeed,
+                            longitudinalSpeed - 10 * dt
+                        );
+                    }
+                }
+
+                if (car.brake > 0.001) {
+                    if (longitudinalSpeed > 0) {
+                        longitudinalSpeed = Math.max(
+                            0,
+                            longitudinalSpeed - brakeForce * car.brake * dt
+                        );
+                    } else {
+                        longitudinalSpeed = Math.min(
+                            0,
+                            longitudinalSpeed + brakeForce * car.brake * dt
+                        );
+                    }
+                }
+
+                if (longitudinalSpeed > gear.maxSpeed) {
+                    longitudinalSpeed = Math.max(
+                        gear.maxSpeed,
+                        longitudinalSpeed - 16 * dt
+                    );
+                }
+            } else {
+                if (longitudinalSpeed > 0) {
+                    longitudinalSpeed = Math.max(
+                        0,
+                        longitudinalSpeed - brakeForce * 0.8 * dt
+                    );
+                }
+
+                if (car.brake > 0.001) {
+                    if (longitudinalSpeed > gear.maxSpeed) {
+                        longitudinalSpeed -= gear.accel * car.brake * dt;
+                    } else {
+                        longitudinalSpeed = Math.min(
+                            gear.maxSpeed,
+                            longitudinalSpeed + 10 * dt
+                        );
+                    }
+                }
+
+                if (car.throttle > 0.001) {
+                    if (longitudinalSpeed < 0) {
+                        longitudinalSpeed = Math.min(
+                            0,
+                            longitudinalSpeed + brakeForce * car.throttle * dt
+                        );
+                    } else {
+                        longitudinalSpeed = Math.max(
+                            0,
+                            longitudinalSpeed -
+                                brakeForce * car.throttle * dt * 0.2
+                        );
+                    }
+                }
+
+                if (longitudinalSpeed < gear.maxSpeed) {
+                    longitudinalSpeed = Math.min(
+                        gear.maxSpeed,
+                        longitudinalSpeed + 12 * dt
+                    );
+                }
+            }
+
+            if (car.throttle < 0.001 && car.brake < 0.001) {
+                longitudinalSpeed *= Math.exp(-0.75 * dt);
+            } else {
+                longitudinalSpeed *= Math.exp(-0.08 * dt);
+            }
+
+            if (handbrake) {
+                const handbrakeBrake =
+                    handbrakeBrakeForce *
+                    (car.throttle > 0.05 ? 0.15 : 1);
+
+                if (longitudinalSpeed > 0) {
+                    longitudinalSpeed = Math.max(
+                        0,
+                        longitudinalSpeed - handbrakeBrake * dt
+                    );
+                } else {
+                    longitudinalSpeed = Math.min(
+                        0,
+                        longitudinalSpeed + handbrakeBrake * dt
+                    );
+                }
+            }
+
+            absSpeed = Math.abs(longitudinalSpeed);
+            const driftSpeed = Math.hypot(longitudinalSpeed, sideSpeed);
+
+            const gearMaxAbs = Math.abs(gear.maxSpeed) || 1;
+            const wheelFrac = clamp(absSpeed / gearMaxAbs, 0, 1);
+
+            let rpm = 900 + wheelFrac * 7600;
+
+            if (car.throttle > 0.01) {
+                rpm = Math.max(
+                    rpm,
+                    900 + (1 - powerFactor) * car.throttle * 7000
+                );
+            }
+
+            car.rpmTarget = clamp(rpm, 900, 10000);
+
+            const targetGrip = handbrake ? handbrakeGrip : normalGrip;
+            const gripLambda = handbrake
+                ? gripEngageRate
+                : gripRecoveryRate;
+
+            currentGrip = damp(currentGrip, targetGrip, gripLambda, dt);
+
+            sideSpeed *= Math.exp(-currentGrip * dt);
+
+            if (handbrake && absSpeed > 1) {
+                sideSpeed +=
+                    -car.steer *
+                    Math.min(absSpeed, 40) *
+                    handbrakeKick *
+                    dt;
+            } else if (
+                currentGrip < 12 &&
+                absSpeed > 2 &&
+                Math.abs(car.steer) > 0.03
+            ) {
+                sideSpeed +=
+                    -car.steer *
+                    Math.min(absSpeed, 40) *
+                    slideSustain *
+                    dt;
+            }
+
+            const maxSideSpeed = Math.min(
+                Math.max(3, driftSpeed * 0.95),
+                34
+            );
+
+            sideSpeed = clamp(sideSpeed, -maxSideSpeed, maxSideSpeed);
+
+            longitudinalSpeed = clamp(
+                longitudinalSpeed,
+                gears[0].maxSpeed,
+                topSpeed
+            );
+
+            if (currentGrip > 40 && Math.abs(sideSpeed) < 0.02) {
+                sideSpeed = 0;
+            }
+
+            car.velocity
+                .copy(forward)
+                .multiplyScalar(longitudinalSpeed)
+                .addScaledVector(side, sideSpeed);
+
+            const totalSpeed = car.velocity.length();
+            const maxTotalSpeed = topSpeed * 1.15;
+
+            if (totalSpeed > maxTotalSpeed) {
+                car.velocity.multiplyScalar(maxTotalSpeed / totalSpeed);
+            }
+
+            car.position.addScaledVector(car.velocity, dt);
+
+            const limit = platformSize / 2 - 2;
+
+            if (car.position.x <= -limit || car.position.x >= limit) {
+                car.velocity.x = 0;
+            }
+
+            if (car.position.z <= -limit || car.position.z >= limit) {
+                car.velocity.z = 0;
+            }
+
+            car.position.x = clamp(car.position.x, -limit, limit);
+            car.position.z = clamp(car.position.z, -limit, limit);
+            car.position.y = 1;
+
+            cube.position.copy(car.position);
+            cube.rotation.y = car.heading;
+        }
+
+        function updateCamera() {
+            const target = car.position.clone().add(cameraLookOffset);
+
+            if (cameraMode === "chase") {
+                const rotatedOffset = cameraOffset.clone();
+                rotatedOffset.applyAxisAngle(
+                    new THREE.Vector3(0, 1, 0),
+                    car.heading
+                );
+
+                const targetCameraPosition = car.position
+                    .clone()
+                    .add(rotatedOffset);
+
+                camera.position.lerp(targetCameraPosition, 0.12);
+                camera.lookAt(target);
+            } else {
+                const cosPitch = Math.cos(orbitPitch);
+
+                const offset = new THREE.Vector3(
+                    Math.sin(orbitYaw) * cosPitch * orbitDistance,
+                    Math.sin(orbitPitch) * orbitDistance,
+                    Math.cos(orbitYaw) * cosPitch * orbitDistance
+                );
+
+                const targetCameraPosition = target.clone().add(offset);
+
+                camera.position.lerp(targetCameraPosition, 0.2);
+                camera.lookAt(target);
+            }
+        }
+
+        function updateLight() {
+            directionalLight.position.set(
+                car.position.x + 30,
+                70,
+                car.position.z + 30
+            );
+
+            directionalLight.target.position.copy(car.position);
+            directionalLight.target.updateMatrixWorld();
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = Math.min(clock.getDelta(), 0.033);
+
+            updateCar(dt);
+            updateCamera();
+            updateLight();
+
+            smoothDisplaySpeed = damp(
+                smoothDisplaySpeed,
+                car.velocity.length(),
+                8,
+                dt
+            );
+
+            smoothRpm = damp(smoothRpm, car.rpmTarget, 12, dt);
+
+            drawGauge(
+                smoothRpm / 1000,
+                smoothDisplaySpeed * 3.6,
+                gearIndex === 0 ? "R" : String(gearIndex)
+            );
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>
